@@ -17,7 +17,6 @@ import faiss
 import numpy as np
 import typing as tp
 import os
-import json
 from enum import Enum
 
 
@@ -39,15 +38,14 @@ def xSIM(
     dim: int = 1024,
     fp16: bool = False,
     eval_text: str = None,
-    augmented_json: str = None,
-) -> tp.Tuple[int, int, tp.Dict[str, int]]:
+) -> tp.Tuple[int, int]:
     assert Margin.has_value(margin), f"Margin type: {margin}, is not supported."
     if not isinstance(x, np.ndarray):
         x = _load_embeddings(x, dim, fp16)
     if not isinstance(y, np.ndarray):
         y = _load_embeddings(y, dim, fp16)
     # calculate xSIM error
-    return calculate_error(x, y, margin, k, eval_text, augmented_json)
+    return calculate_error(x, y, margin, k, eval_text)
 
 
 def _load_embeddings(infile: str, dim: int, fp16: bool = False) -> np.ndarray:
@@ -60,7 +58,7 @@ def _load_embeddings(infile: str, dim: int, fp16: bool = False) -> np.ndarray:
     return emb
 
 
-def score_margin(
+def _score_margin(
     Dxy: np.ndarray,
     Ixy: np.ndarray,
     Ax: np.ndarray,
@@ -103,7 +101,7 @@ def _score_knn(x: np.ndarray, y: np.ndarray, k: int, margin: str) -> np.ndarray:
         Avg_xy = Cos_xy.mean(axis=1)
         Avg_yx = Cos_yx.mean(axis=1)
 
-        scores = score_margin(Cos_xy, Idx_xy, Avg_xy, Avg_yx, margin, k)
+        scores = _score_margin(Cos_xy, Idx_xy, Avg_xy, Avg_yx, margin, k)
 
         # find best
         best = scores.argmax(axis=1)
@@ -113,35 +111,17 @@ def _score_knn(x: np.ndarray, y: np.ndarray, k: int, margin: str) -> np.ndarray:
     return indices
 
 
-def get_transform(augmented_json, closest_neighbor, src):
-    if (
-        closest_neighbor in augmented_json
-        and augmented_json[closest_neighbor]["src"] == src
-    ):
-        return augmented_json[closest_neighbor]["errtype"]
-    return "Misaligned"
-
-
 def calculate_error(
     x: np.ndarray,
     y: np.ndarray,
     margin: str = None,
     k: int = 4,
     eval_text: str = None,
-    augmented_json: str = None,
-) -> tp.Tuple[int, int, tp.Dict[str, int]]:
-    if augmented_json:
-        with open(augmented_json) as f:
-            augmented_json = json.load(f)
-        assert (
-            x.shape[0] < y.shape[0]
-        ), f"Shape mismatch: {x.shape[0]} >= target {y.shape[0]}"
-    else:
-        assert (
-            x.shape == y.shape
-        ), f"number of source {x.shape} / target {y.shape} shapes mismatch, "
+) -> tp.Tuple[int, int]:
+    assert (
+        x.shape == y.shape
+    ), f"number of source {x.shape} / target {y.shape} shapes mismatch"
     nbex = x.shape[0]
-    augmented_report = {}
 
     # for each x calculate the highest scoring neighbor from y
     closest_neighbor = _score_knn(x, y, k, margin)
@@ -152,14 +132,7 @@ def calculate_error(
         for ex in range(nbex):
             if lines[ex] != lines[closest_neighbor[ex, 0]]:
                 err += 1
-                if augmented_json:
-                    transform = get_transform(
-                        augmented_json,
-                        lines[closest_neighbor[ex, 0]].strip(),
-                        lines[ex].strip(),
-                    )
-                    augmented_report[transform] = augmented_report.get(transform, 0) + 1
     else:  # calc index error
         ref = np.linspace(0, nbex - 1, nbex).astype(int)  # [0, nbex)
         err = nbex - np.equal(closest_neighbor.reshape(nbex), ref).astype(int).sum()
-    return err, nbex, augmented_report
+    return err, nbex

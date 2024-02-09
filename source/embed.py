@@ -16,25 +16,35 @@
 # The functions can be also imported into another Python code
 
 
-import argparse
-import logging
-import os
 import re
-import sys
+import os
 import tempfile
+import sys
 import time
-from collections import namedtuple
-from pathlib import Path
-from subprocess import run
-from typing import Optional, Union
-
-assert os.environ.get("LASER"), "Please set the environment variable LASER"
-LASER = os.environ["LASER"]
-sys.path.append(LASER)
-
+import argparse
 import numpy as np
-from lib.text_processing import BPEfastApply, SPMApply, Token
-from laser_encoders.models import SentenceEncoder
+import logging
+from collections import namedtuple
+from subprocess import run
+from pathlib import Path
+from typing import Optional, Tuple, Union
+import  shutil 
+
+import torch
+import torch.nn as nn
+
+
+from lib.text_processing import Token, BPEfastApply, SPMApply
+
+from fairseq.models.transformer import (
+    Embedding,
+    TransformerEncoder,
+)
+from fairseq.modules import TransformerSentenceEncoder
+from fairseq.models.masked_lm import MaskedLMEncoder
+from fairseq.data.legacy.masked_lm_dictionary import XLMDictionary
+from fairseq.data.dictionary import Dictionary
+from fairseq.modules import LayerNorm
 
 SPACE_NORMALIZER = re.compile(r"\s+")
 Batch = namedtuple("Batch", "srcs tokens lengths")
@@ -42,10 +52,8 @@ Batch = namedtuple("Batch", "srcs tokens lengths")
 logging.basicConfig(
     stream=sys.stdout,
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("embed")
-
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logger = logging.getLogger('embed')
 
 def buffered_read(fp, buffer_size):
     buffer = []
@@ -59,10 +67,163 @@ def buffered_read(fp, buffer_size):
         yield buffer
 
 
-class HuggingFaceEncoder:
+class SentenceEncoder:
+    def __init__(
+        self,
+        model_path,
+        max_sentences=None,
+        max_tokens=None,
+        spm_vocab=None,
+        cpu=False,
+        fp16=False,
+        verbose=False,
+        lang=None,
+        sort_kind="quicksort",
+        layer=-5,
+        criterion="mean"
+    ):
+        if verbose:
+            logger.info(f"loading encoder: {model_path}")
+        self.use_cuda = torch.cuda.is_available() and not cpu
+        self.max_sentences = max_sentences
+        self.max_tokens = max_tokens
+        self.lang = lang
+        if self.max_tokens is None and self.max_sentences is None:
+            self.max_sentences = 1
+
+        state_dict = torch.load(model_path)
+        if "params" in state_dict:
+            self.encoder = LaserLstmEncoder(**state_dict["params"])
+            self.encoder.load_state_dict(state_dict["model"])
+            self.dictionary = state_dict["dictionary"]
+            self.prepend_bos = False
+            self.left_padding = False
+            self.bos_index = self.dictionary["<s>"] = 0
+            self.pad_index = self.dictionary["<pad>"] = 1
+            self.eos_index = self.dictionary["</s>"] = 2
+            self.unk_index = self.dictionary["<unk>"] = 3
+            self.dim = 1024
+        elif "args" in state_dict and state_dict["args"] and state_dict["args"].task == "xlm":
+            self.encoder = XLMEncoder(state_dict, model_path.replace(".pt", ".dict"), layer, criterion)
+            if "xlm_args" in state_dict:
+                self.encoder.xlm_args = state_dict["xlm_args"]
+                self.encoder.langs = self.encoder.xlm_args['langs']
+                self.encoder.id2lang = {k: v for k, v in enumerate(sorted(self.encoder.langs))}
+                self.encoder.lang2id = {k: v for v, k in self.encoder.id2lang.items()}
+                self.encoder.n_langs = len(self.encoder.langs)
+                self.encoder.lang = lang
+            self.dictionary = self.encoder.dictionary.indices
+            self.prepend_bos = True
+            self.left_padding = False
+            #self.bos_index = self.dictionary["<s>"] = 0
+            self.eos_index = self.bos_index = self.encoder.eos_idx # XLM is originally trained with BOS equal to EOS (BOS is not used)
+            self.pad_index = self.encoder.pad_idx
+            self.unk_index = self.encoder.unk_idx
+            assert self.dictionary["</s>"] ==  self.encoder.eos_idx 
+            assert self.dictionary["<pad>"] == self.encoder.pad_idx
+            assert self.dictionary["<unk>"] == self.encoder.unk_idx
+            self.dim = self.encoder.args.encoder_embed_dim
+        else:
+            print(spm_vocab)
+            self.encoder = LaserTransformerEncoder(state_dict, spm_vocab)
+            self.dictionary = self.encoder.dictionary.indices
+            self.prepend_bos = state_dict["cfg"]["model"].prepend_bos
+            self.left_padding = state_dict["cfg"]["model"].left_pad_source
+            self.bos_index = self.dictionary["<s>"] = 0
+            self.pad_index = self.dictionary["<pad>"] = 1
+            self.eos_index = self.dictionary["</s>"] = 2
+            self.unk_index = self.dictionary["<unk>"] = 3
+            self.dim = 1024
+        del state_dict
+
+        if fp16:
+            self.encoder.half()
+        if self.use_cuda:
+            if verbose:
+                logger.info("transfer encoder to GPU")
+            self.encoder.cuda()
+        self.encoder.eval()
+        self.sort_kind = sort_kind
+
+    def _process_batch(self, batch):
+        tokens = batch.tokens
+        lengths = batch.lengths
+        if self.use_cuda:
+            tokens = tokens.cuda()
+            lengths = lengths.cuda()
+
+        with torch.no_grad():
+            sentemb = self.encoder(tokens, lengths)["sentemb"]
+        embeddings = sentemb.detach().cpu().numpy()
+        return embeddings
+
+    def _tokenize(self, line):
+        tokens = SPACE_NORMALIZER.sub(" ", line).strip().split()
+        if len(tokens) > 150:
+            tokens = tokens[:150]
+        ntokens = len(tokens)
+        if self.prepend_bos:
+            ids = torch.LongTensor(ntokens + 2)
+            ids[0] = self.bos_index
+            for i, token in enumerate(tokens):
+                ids[i + 1] = self.dictionary.get(token, self.unk_index)
+            ids[ntokens + 1] = self.eos_index
+        else:
+            ids = torch.LongTensor(ntokens + 1)
+            for i, token in enumerate(tokens):
+                ids[i] = self.dictionary.get(token, self.unk_index)
+            ids[ntokens] = self.eos_index
+        return ids
+
+    def _make_batches(self, lines):
+        tokens = [self._tokenize(line) for line in lines]
+        lengths = np.array([t.numel() for t in tokens])
+        indices = np.argsort(-lengths, kind=self.sort_kind)
+
+        def batch(tokens, lengths, indices):
+            toks = tokens[0].new_full((len(tokens), tokens[0].shape[0]), self.pad_index)
+            if not self.left_padding:
+                for i in range(len(tokens)):
+                    toks[i, : tokens[i].shape[0]] = tokens[i]
+            else:
+                for i in range(len(tokens)):
+                    toks[i, -tokens[i].shape[0] :] = tokens[i]
+            return (
+                Batch(srcs=None, tokens=toks, lengths=torch.LongTensor(lengths)),
+                indices,
+            )
+
+        batch_tokens, batch_lengths, batch_indices = [], [], []
+        ntokens = nsentences = 0
+        for i in indices:
+            if nsentences > 0 and (
+                (self.max_tokens is not None and ntokens + lengths[i] > self.max_tokens)
+                or (self.max_sentences is not None and nsentences == self.max_sentences)
+            ):
+                yield batch(batch_tokens, batch_lengths, batch_indices)
+                ntokens = nsentences = 0
+                batch_tokens, batch_lengths, batch_indices = [], [], []
+            batch_tokens.append(tokens[i])
+            batch_lengths.append(lengths[i])
+            batch_indices.append(i)
+            ntokens += tokens[i].shape[0]
+            nsentences += 1
+        if nsentences > 0:
+            yield batch(batch_tokens, batch_lengths, batch_indices)
+
+    def encode_sentences(self, sentences):
+        indices = []
+        results = []
+        for batch, batch_indices in self._make_batches(sentences):
+            indices.extend(batch_indices)
+            results.append(self._process_batch(batch))
+        return np.vstack(results)[np.argsort(indices, kind=self.sort_kind)]
+
+
+class HuggingFaceSentenceEncoder(SentenceEncoder):
+    #TODO: Add support
     def __init__(self, encoder_name: str, verbose=False):
         from sentence_transformers import SentenceTransformer
-
         encoder = f"sentence-transformers/{encoder_name}"
         if verbose:
             logger.info(f"loading HuggingFace encoder: {encoder}")
@@ -72,16 +233,266 @@ class HuggingFaceEncoder:
         return self.encoder.encode(sentences)
 
 
+class HuggingFaceEncoder():
+    def __init__(self, encoder_name: str, verbose=False, **encoder_kwargs):
+        from transformers import AutoTokenizer, AutoModelForMaskedLM
+        self.use_cuda = torch.cuda.is_available()
+        self.layer = encoder_kwargs['layer']
+        self.criterion = encoder_kwargs['criterion']
+
+        if verbose:
+            logger.info(f"loading HuggingFace encoder: {encoder_name} with layer {self.layer}")
+        self.tokenizer = AutoTokenizer.from_pretrained(encoder_name)#'cis-lmu/glot500-base')
+        self.encoder = AutoModelForMaskedLM.from_pretrained(encoder_name)#"cis-lmu/glot500-base")
+        if self.use_cuda:
+            self.encoder.cuda()
+
+    def _make_batches(self, sentences):
+        batch = []
+        for s in sentences:
+            if len(s) > 100:
+                s = s[:100] 
+            elif len(s) == 0:
+                s = "."
+
+            batch.append(s)
+            if len(batch) == 50:
+                yield batch
+                batch = []
+        if batch:        
+            yield batch
+
+
+    def _process_batch(self, batch):
+        encoded_input = self.tokenizer(batch, return_tensors='pt', padding=True)
+        if self.use_cuda:
+            for k, v in encoded_input.items():
+                encoded_input[k] = v.to("cuda")
+        with torch.no_grad():
+            x = self.encoder(**encoded_input, output_hidden_states=True)[1][self.layer]
+        padding_mask = encoded_input['attention_mask']
+        padding_mask = padding_mask[:,:,None]
+        src_length = padding_mask.sum(dim=1)
+        #src_length = src_length[:, :, None]
+        x = (x * padding_mask).sum(dim=1)
+        src_length = src_length.cpu()
+        x = x.cpu().detach()
+        for k, v in encoded_input.items():
+            del v
+        return x / src_length
+
+    def encode_sentences(self, sentences):
+        results = []
+        for batch in self._make_batches(sentences):
+            results.append(self._process_batch(batch))
+        print(len(results))
+        print(results[0].shape)
+        return np.vstack(results)
+
+
+class XLMEncoder(MaskedLMEncoder):
+    def __init__(self, state_dict, vocab_path, layer, criterion):
+        self.args = state_dict["args"]
+        self.args.offset_positions_by_padding = False
+        self.args.max_positions = 512
+        dictionary = Dictionary.load(vocab_path)
+        self.pad_idx = 1
+        self.eos_idx = self.bos_idx = 2 # XLM is originally trained with BOS equal to EOS
+        self.unk_idx = 3
+        super().__init__(self.args, dictionary)
+        self.load_state_dict(state_dict["encoder"])
+        self.layer = layer
+        self.sentemb_criterion = criterion
+        
+    
+    def forward(self, src_tokens, src_lengths):
+        if hasattr(self, "lang2id"):  
+            lang_labels = torch.ones_like(src_tokens).fill_(self.lang2id[self.lang])
+        else:
+            lang_labels = None
+        encoder_out = super().forward(src_tokens, segment_labels=lang_labels)
+        x = encoder_out[1]["inner_states"][self.layer]
+        if self.sentemb_criterion == "cls":
+            cls_indices = src_tokens.eq(self.bos_idx).t()
+            sentemb = x[cls_indices, :]
+        else:
+            padding_mask = src_tokens.eq(self.pad_idx).t().unsqueeze(-1)
+            if self.sentemb_criterion == "max":
+                if padding_mask.any():
+                    x = x.float().masked_fill_(padding_mask, float("-inf")).type_as(x)
+                sentemb = x.max(dim=0)[0]
+            elif self.sentemb_criterion == "mean":
+                if padding_mask.any():
+                    x = x.float().masked_fill_(padding_mask, 0).type_as(x)
+                sentemb = x.sum(dim=0)/src_lengths.unsqueeze(dim=1).expand(x.size()[1:])
+            else:  
+                assert True, "Unknown criterion"
+        return {"sentemb": sentemb}
+
+class LaserTransformerEncoder(TransformerEncoder):
+    def __init__(self, state_dict, vocab_path):
+        self.dictionary = Dictionary.load(vocab_path)
+        if any(
+            k in state_dict["model"]
+            for k in ["encoder.layer_norm.weight", "layer_norm.weight"]
+        ):
+            self.dictionary.add_symbol("<mask>")
+        cfg = state_dict["cfg"]["model"]
+        self.sentemb_criterion = cfg.sentemb_criterion
+        self.pad_idx = self.dictionary.pad_index
+        self.bos_idx = self.dictionary.bos_index
+        self.dictionary.add_symbol("<mask>") # XXX ivana
+        embed_tokens = Embedding(
+            len(self.dictionary), cfg.encoder_embed_dim, self.pad_idx,
+        )
+        super().__init__(cfg, self.dictionary, embed_tokens)
+        if "decoder.version" in state_dict["model"]:
+            self._remove_decoder_layers(state_dict)
+        if "layer_norm.weight" in state_dict["model"]:
+            self.layer_norm = LayerNorm(cfg.encoder_embed_dim)
+        self.load_state_dict(state_dict["model"])
+
+    def _remove_decoder_layers(self, state_dict):
+        for key in list(state_dict["model"].keys()):
+            if not key.startswith(
+                (
+                    "encoder.layer_norm",
+                    "encoder.layers",
+                    "encoder.embed",
+                    "encoder.version",
+                )
+            ):
+                del state_dict["model"][key]
+            else:
+                renamed_key = key.replace("encoder.", "")
+                state_dict["model"][renamed_key] = state_dict["model"].pop(key)
+
+    def forward(self, src_tokens, src_lengths):
+        encoder_out = super().forward(src_tokens, src_lengths)
+        if isinstance(encoder_out, dict):
+            x = encoder_out["encoder_out"][0]  # T x B x C
+        else:
+            x = encoder_out[0]
+        if self.sentemb_criterion == "cls":
+            cls_indices = src_tokens.eq(self.bos_idx).t()
+            sentemb = x[cls_indices, :]
+        else:
+            padding_mask = src_tokens.eq(self.pad_idx).t().unsqueeze(-1)
+            if padding_mask.any():
+                x = x.float().masked_fill_(padding_mask, float("-inf")).type_as(x)
+            sentemb = x.max(dim=0)[0]
+        return {"sentemb": sentemb}
+
+
+class LaserLstmEncoder(nn.Module):
+    def __init__(
+        self,
+        num_embeddings,
+        padding_idx,
+        embed_dim=320,
+        hidden_size=512,
+        num_layers=1,
+        bidirectional=False,
+        left_pad=True,
+        padding_value=0.0,
+    ):
+        super().__init__()
+
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.hidden_size = hidden_size
+
+        self.padding_idx = padding_idx
+        self.embed_tokens = nn.Embedding(
+            num_embeddings, embed_dim, padding_idx=self.padding_idx
+        )
+
+        self.lstm = nn.LSTM(
+            input_size=embed_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bidirectional=bidirectional,
+        )
+        self.left_pad = left_pad
+        self.padding_value = padding_value
+
+        self.output_units = hidden_size
+        if bidirectional:
+            self.output_units *= 2
+
+    def forward(self, src_tokens, src_lengths):
+        bsz, seqlen = src_tokens.size()
+
+        # embed tokens
+        x = self.embed_tokens(src_tokens)
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+
+        # pack embedded source tokens into a PackedSequence
+        packed_x = nn.utils.rnn.pack_padded_sequence(x, src_lengths.data.tolist())
+
+        # apply LSTM
+        if self.bidirectional:
+            state_size = 2 * self.num_layers, bsz, self.hidden_size
+        else:
+            state_size = self.num_layers, bsz, self.hidden_size
+        h0 = x.data.new(*state_size).zero_()
+        c0 = x.data.new(*state_size).zero_()
+        packed_outs, (final_hiddens, final_cells) = self.lstm(packed_x, (h0, c0))
+
+        # unpack outputs and apply dropout
+        x, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_outs, padding_value=self.padding_value
+        )
+        assert list(x.size()) == [seqlen, bsz, self.output_units]
+
+        if self.bidirectional:
+
+            def combine_bidir(outs):
+                return torch.cat(
+                    [
+                        torch.cat([outs[2 * i], outs[2 * i + 1]], dim=0).view(
+                            1, bsz, self.output_units
+                        )
+                        for i in range(self.num_layers)
+                    ],
+                    dim=0,
+                )
+
+            final_hiddens = combine_bidir(final_hiddens)
+            final_cells = combine_bidir(final_cells)
+
+        encoder_padding_mask = src_tokens.eq(self.padding_idx).t()
+
+        # Set padded outputs to -inf so they are not selected by max-pooling
+        padding_mask = src_tokens.eq(self.padding_idx).t().unsqueeze(-1)
+        if padding_mask.any():
+            x = x.float().masked_fill_(padding_mask, float("-inf")).type_as(x)
+
+        # Build the sentence embedding by max-pooling over the encoder outputs
+        sentemb = x.max(dim=0)[0]
+
+        return {
+            "sentemb": sentemb,
+            "encoder_out": (x, final_hiddens, final_cells),
+            "encoder_padding_mask": encoder_padding_mask
+            if encoder_padding_mask.any()
+            else None,
+        }
+
+
 def load_model(
     encoder: str,
     spm_model: str,
     bpe_codes: str,
     hugging_face=False,
+    lang=None,
     verbose=False,
-    **encoder_kwargs,
+    **encoder_kwargs
 ) -> Union[SentenceEncoder, HuggingFaceEncoder]:
     if hugging_face:
-        return HuggingFaceEncoder(encoder, verbose=verbose)
+        return HuggingFaceEncoder(encoder, verbose=verbose,  **encoder_kwargs)
     if spm_model:
         spm_vocab = str(Path(spm_model).with_suffix(".cvocab"))
         if verbose:
@@ -90,7 +501,7 @@ def load_model(
     else:
         spm_vocab = None
     return SentenceEncoder(
-        encoder, spm_vocab=spm_vocab, verbose=verbose, **encoder_kwargs
+        encoder, spm_vocab=spm_vocab, verbose=verbose, lang=lang, **encoder_kwargs
     )
 
 
@@ -124,7 +535,9 @@ def EncodeFilep(
 ):
     n = 0
     t = time.time()
+    #import pdb; pdb.set_trace()
     for sentences in buffered_read(inp_file, buffer_size):
+        #import pdb; pdb.set_trace()
         encoded = encoder.encode_sentences(sentences)
         if fp16:
             encoded = encoded.astype(np.float16)
@@ -134,6 +547,7 @@ def EncodeFilep(
             logger.info("encoded {:d} sentences".format(n))
     if verbose:
         logger.info(f"encoded {n} sentences in {EncodeTime(t)}")
+
 
 
 # Encode sentences (file names)
@@ -152,8 +566,7 @@ def EncodeFile(
         if verbose:
             logger.info(
                 "encoding {} to {}".format(
-                    inp_fname if len(inp_fname) > 0 else "stdin",
-                    out_fname,
+                    inp_fname if len(inp_fname) > 0 else "stdin", out_fname,
                 )
             )
         fin = (
@@ -172,11 +585,11 @@ def EncodeFile(
 
 
 # Load existing embeddings
-def EmbedLoad(fname, dim=1024, verbose=False, fp16=False):
-    x = np.fromfile(fname, dtype=(np.float16 if fp16 else np.float32), count=-1)
+def EmbedLoad(fname, dim=1024, verbose=False, count=-1):
+    x = np.fromfile(fname, dtype=np.float32, count=count)
     x.resize(x.shape[0] // dim, dim)
     if verbose:
-        print(" - Embeddings: {:s}, {:d}x{:d}".format(fname, x.shape[0], dim))
+        print(" - Embeddings: {:d}x{:d}".format(x.shape[0], dim))
     return x
 
 
@@ -190,15 +603,15 @@ def EmbedMmap(fname, dim=1024, dtype=np.float32, verbose=False):
 
 
 def embed_sentences(
-    ifname: str,
-    output: str,
+    ifname: Path,
+    output: Path,
     encoder: Union[SentenceEncoder, HuggingFaceEncoder] = None,
-    encoder_path: str = None,
-    hugging_face=False,
+    encoder_path: Path = None,
+    hugging_face = False,
     token_lang: Optional[str] = "--",
-    bpe_codes: Optional[str] = None,
+    bpe_codes: Optional[Path] = None,
     spm_lang: Optional[str] = "en",
-    spm_model: Optional[str] = None,
+    spm_model: Optional[Path] = None,
     verbose: bool = False,
     buffer_size: int = 10000,
     max_tokens: int = 12000,
@@ -206,6 +619,8 @@ def embed_sentences(
     cpu: bool = False,
     fp16: bool = False,
     sort_kind: str = "quicksort",
+    layer: int = -5,
+    criterion: str = "mean"
 ):
     assert encoder or encoder_path, "Provide initialised encoder or encoder_path"
     buffer_size = max(buffer_size, 1)
@@ -226,7 +641,11 @@ def embed_sentences(
             max_tokens=max_tokens,
             sort_kind=sort_kind,
             cpu=cpu,
+            layer=layer,
+            criterion=criterion,
+            lang=token_lang
         )
+
     if not ifname:
         ifname = ""  # default to stdin
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -237,17 +656,19 @@ def embed_sentences(
                 tok_fname,
                 lang=token_lang,
                 romanize=True if token_lang == "el" else False,
-                lower_case=True,
+                lower_case=args.lower_case,
                 gzip=False,
                 verbose=verbose,
                 over_write=False,
             )
             ifname = tok_fname
 
+
+
         if bpe_codes:
             if ifname == "":  # stdin
                 ifname = os.path.join(tmpdir, "no_tok")
-                run(f"cat > {ifname}", shell=True)
+                run(f'cat > {ifname}', shell=True)
             bpe_fname = os.path.join(tmpdir, "bpe")
             BPEfastApply(
                 ifname, bpe_fname, bpe_codes, verbose=verbose, over_write=False
@@ -261,7 +682,7 @@ def embed_sentences(
                 spm_fname,
                 spm_model,
                 lang=spm_lang,
-                lower_case=True,
+                lower_case=False,#args.lower_case,
                 verbose=verbose,
                 over_write=False,
             )
@@ -276,23 +697,20 @@ def embed_sentences(
             buffer_size=buffer_size,
             fp16=fp16,
         )
+        #shutil.copytree(tmpdir, '/lnet/troja/work/people/kvapilikova/LASER/tasks/bucc/tmpdir')
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LASER: Embed sentences")
     parser.add_argument(
-        "-i",
-        "--input",
-        type=str,
-        default=None,
-        help="Input text file",
+        "-i", "--input", type=str, default=None, help="Input text file",
     )
     parser.add_argument("--encoder", type=str, required=True, help="encoder to be used")
     parser.add_argument(
         "--token-lang",
         type=str,
         default="--",
-        help="Perform tokenization with given language ('--' for no tokenization)",
+        help="Perform tokenization with given language ('--' for no tokenization); the language will also be used in case language embeddings are needed",
     )
     parser.add_argument(
         "--bpe-codes", type=str, default=None, help="Apply BPE using specified codes"
@@ -302,6 +720,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--spm-model", type=str, default=None, help="Apply SPM using specified model"
+    )
+    parser.add_argument(
+        "--lower-case", action="store_true", help="Lowercase"
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Detailed output")
 
@@ -337,9 +758,17 @@ if __name__ == "__main__":
         help="Algorithm used to sort batch by length",
     )
     parser.add_argument(
-        "--use-hugging-face",
-        action="store_true",
-        help="Use a HuggingFace sentence transformer",
+        "--use-hugging-face", action="store_true", help="Use a HuggingFace transformer") 
+    parser.add_argument(
+        "--layer",
+        type=int,
+        default=-5,
+        help="Layer numer for XLM",
+    )
+    parser.add_argument(
+         "--criterion",
+         type=str,
+         default="mean"
     )
 
     args = parser.parse_args()
@@ -359,4 +788,7 @@ if __name__ == "__main__":
         cpu=args.cpu,
         fp16=args.fp16,
         sort_kind=args.sort_kind,
+        criterion=args.criterion,
+        layer=args.layer
     )
+    print("Maximun memory allocated %d" % torch.cuda.max_memory_allocated("cuda"))

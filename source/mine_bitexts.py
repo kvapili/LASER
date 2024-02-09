@@ -40,8 +40,11 @@ from lib.text_processing import Token, BPEfastApply
 
 def TextLoadUnify(fname, args):
     if args.verbose:
-        print(' - loading texts {:s}: '.format(fname), end='')
-    fin = open(fname, encoding=args.encoding, errors='surrogateescape')
+        print(' - loading texts: ',flush=True)
+    if isinstance(fname, str):
+        fin = open(fname, encoding=args.encoding, errors='surrogateescape')
+    else:
+        fin = fname
     inds = []
     sents = []
     sent2ind = {}
@@ -58,9 +61,13 @@ def TextLoadUnify(fname, args):
             sents.append(line[:-1])
             nu += 1
         n += 1
+        if n == args.buffer:
+            break
     if args.verbose:
-        print('{:d} lines, {:d} unique'.format(n, nu))
+        print('{:d} lines, {:d} unique'.format(n, nu),flush=True)
     del sent2ind
+    if isinstance(fname, str):
+        fin.close()
     return inds, sents
 
 
@@ -134,7 +141,7 @@ def score(x, y, fwd_mean, bwd_mean, margin):
 
 def score_candidates(x, y, candidate_inds, fwd_mean, bwd_mean, margin, verbose=False):
     if verbose:
-        print(' - scoring {:d} candidates'.format(x.shape[0]))
+        print(' - scoring {:d} candidates'.format(x.shape[0]),flush=True)
     scores = np.zeros(candidate_inds.shape)
     for i in range(scores.shape[0]):
         for j in range(scores.shape[1]):
@@ -142,6 +149,93 @@ def score_candidates(x, y, candidate_inds, fwd_mean, bwd_mean, margin, verbose=F
             scores[i, j] = score(x[i], y[k], fwd_mean[i], bwd_mean[k], margin)
     return scores
 
+
+###############################################################################
+#
+# Mining
+#
+###############################################################################
+
+def mine(x, y, src_inds, trg_inds, fout, args):
+    if args.unify:
+        x = unique_embeddings(x, src_inds, args.verbose)
+    faiss.normalize_L2(x)
+    if args.unify:
+        y = unique_embeddings(y, trg_inds, args.verbose)
+    faiss.normalize_L2(y)
+
+    # calculate knn in both directions
+    if args.verbose:
+        print(' - perform {:d}-nn source against target'.format(args.neighborhood),flush=True)
+    x2y_sim, x2y_ind = knn(x, y, min(y.shape[0], args.neighborhood), use_gpu)
+    x2y_mean = x2y_sim.mean(axis=1)
+
+    if args.verbose:
+        print(' - perform {:d}-nn target against source'.format(args.neighborhood),flush=True)
+    y2x_sim, y2x_ind = knn(y, x, min(x.shape[0], args.neighborhood), use_gpu)
+    y2x_mean = y2x_sim.mean(axis=1)
+
+    # margin function
+    if args.margin == 'absolute':
+        margin = lambda a, b: a
+    elif args.margin == 'distance':
+        margin = lambda a, b: a - b
+    else:  # args.margin == 'ratio':
+        margin = lambda a, b: a / b
+
+
+    if args.mode == 'search':
+        if args.verbose:
+            print(' - Searching for closest sentences in target',flush=True)
+            print(' - writing alignments to {:s}'.format(args.output),flush=True)
+        scores = score_candidates(x, y, x2y_ind, x2y_mean, y2x_mean, margin, args.verbose)
+        best = x2y_ind[np.arange(x.shape[0]), scores.argmax(axis=1)]
+
+        nbex = x.shape[0]
+        ref = np.linspace(0, nbex-1, nbex).astype(int)  # [0, nbex)
+        err = nbex - np.equal(best.reshape(nbex), ref).astype(int).sum()
+        print(' - errors: {:d}={:.2f}%'.format(err, 100*err/nbex),flush=True)
+        for i in src_inds:
+            print(trg_sents[best[i]], file=fout)
+
+    elif args.mode == 'score':
+        for i, j in zip(src_inds, trg_inds):
+            s = score(x[i], y[j], x2y_mean[i], y2x_mean[j], margin)
+            print(s, src_sents[i], trg_sents[j], sep='\t', file=fout)
+
+    elif args.mode == 'mine':
+        if args.verbose:
+            print(' - mining for parallel data',flush=True)
+        fwd_scores = score_candidates(x, y, x2y_ind, x2y_mean, y2x_mean, margin, args.verbose)
+        bwd_scores = score_candidates(y, x, y2x_ind, y2x_mean, x2y_mean, margin, args.verbose)
+        fwd_best = x2y_ind[np.arange(x.shape[0]), fwd_scores.argmax(axis=1)]
+        bwd_best = y2x_ind[np.arange(y.shape[0]), bwd_scores.argmax(axis=1)]
+        if args.verbose:
+            print(' - writing alignments to {:s}'.format(args.output),flush=True)
+            if args.threshold > 0:
+                print(' - with threshold of {:f}'.format(args.threshold),flush=True)
+        if args.retrieval == 'fwd':
+            for i, j in enumerate(fwd_best):
+                print(fwd_scores[i].max(), src_sents[i], trg_sents[j], sep='\t', file=fout)
+        if args.retrieval == 'bwd':
+            for j, i in enumerate(bwd_best):
+                print(bwd_scores[j].max(), src_sents[i], trg_sents[j], sep='\t', file=fout)
+        if args.retrieval == 'intersect':
+            for i, j in enumerate(fwd_best):
+                if bwd_best[j] == i:
+                    print(fwd_scores[i].max(), src_sents[i], trg_sents[j], sep='\t', file=fout)
+        if args.retrieval == 'max':
+            indices = np.stack((np.concatenate((np.arange(x.shape[0]), bwd_best)),
+                                np.concatenate((fwd_best, np.arange(y.shape[0])))), axis=1)
+            scores = np.concatenate((fwd_scores.max(axis=1), bwd_scores.max(axis=1)))
+            seen_src, seen_trg = set(), set()
+            for i in np.argsort(-scores):
+                src_ind, trg_ind = indices[i]
+                if not src_ind in seen_src and not trg_ind in seen_trg:
+                    seen_src.add(src_ind)
+                    seen_trg.add(trg_ind)
+                    if scores[i] > args.threshold:
+                        print(scores[i], src_sents[src_ind], trg_sents[trg_ind], sep='\t', file=fout)
 
 ###############################################################################
 #
@@ -193,8 +287,10 @@ if __name__ == '__main__':
         help='Precomputed target sentence embeddings')
     parser.add_argument('--dim', type=int, default=1024,
         help='Embedding dimensionality')
-    parser.add_argument('--fp16', action='store_true',
-        help='Load precomputed embeddings in float16 format')
+    parser.add_argument('--buffer', type=int, default=1000000,
+        help='Buffer Size')
+    parser.add_argument('--max_it', type=int, default=-1,
+        help='Max number of mining iterations')
     args = parser.parse_args()
 
     print('LASER: tool to search, score or mine bitexts')
@@ -204,99 +300,39 @@ if __name__ == '__main__':
     else:
         print(' - knn will run on CPU (slow)')
 
-    src_inds, src_sents = TextLoadUnify(args.src, args)
-    trg_inds, trg_sents = TextLoadUnify(args.trg, args)
 
     def unique_embeddings(emb, ind, verbose=False):
         aux = {j: i for i, j in enumerate(ind)}
         if verbose:
-            print(' - unify embeddings: {:d} -> {:d}'.format(len(emb), len(aux)))
+            print(' - unify embeddings: {:d} -> {:d}'.format(len(emb), len(aux)),flush=True)
         return emb[[aux[i] for i in range(len(aux))]]
 
-    # load the embeddings and store as np.float32 (required for FAISS)
-    x = EmbedLoad(args.src_embeddings, args.dim, verbose=args.verbose, fp16=args.fp16).astype(np.float32)
-    if args.unify:
-        x = unique_embeddings(x, src_inds, args.verbose)
-    faiss.normalize_L2(x)
-    y = EmbedLoad(args.trg_embeddings, args.dim, verbose=args.verbose, fp16=args.fp16).astype(np.float32)
-    if args.unify:
-        y = unique_embeddings(y, trg_inds, args.verbose)
-    faiss.normalize_L2(y)
-
-    # calculate knn in both directions
-    if args.retrieval != 'bwd':
-        if args.verbose:
-            print(' - perform {:d}-nn source against target'.format(args.neighborhood))
-        x2y_sim, x2y_ind = knn(x, y, min(y.shape[0], args.neighborhood), use_gpu)
-        x2y_mean = x2y_sim.mean(axis=1)
-
-    if args.retrieval != 'fwd':
-        if args.verbose:
-            print(' - perform {:d}-nn target against source'.format(args.neighborhood))
-        y2x_sim, y2x_ind = knn(y, x, min(x.shape[0], args.neighborhood), use_gpu)
-        y2x_mean = y2x_sim.mean(axis=1)
-
-    # margin function
-    if args.margin == 'absolute':
-        margin = lambda a, b: a
-    elif args.margin == 'distance':
-        margin = lambda a, b: a - b
-    else:  # args.margin == 'ratio':
-        margin = lambda a, b: a / b
-
+    # load the embeddings
     fout = open(args.output, mode='w', encoding=args.encoding, errors='surrogateescape')
-
-    if args.mode == 'search':
-        if args.verbose:
-            print(' - Searching for closest sentences in target')
-            print(' - writing alignments to {:s}'.format(args.output))
-        scores = score_candidates(x, y, x2y_ind, x2y_mean, y2x_mean, margin, args.verbose)
-        best = x2y_ind[np.arange(x.shape[0]), scores.argmax(axis=1)]
-
-        nbex = x.shape[0]
-        ref = np.linspace(0, nbex-1, nbex).astype(int)  # [0, nbex)
-        err = nbex - np.equal(best.reshape(nbex), ref).astype(int).sum()
-        print(' - errors: {:d}={:.2f}%'.format(err, 100*err/nbex))
-        for i in src_inds:
-            print(trg_sents[best[i]], file=fout)
-
-    elif args.mode == 'score':
-        for i, j in zip(src_inds, trg_inds):
-            s = score(x[i], y[j], x2y_mean[i], y2x_mean[j], margin)
-            print(s, src_sents[i], trg_sents[j], sep='\t', file=fout)
-
-    elif args.mode == 'mine':
-        if args.verbose:
-            print(' - mining for parallel data')
-        fwd_scores = score_candidates(x, y, x2y_ind, x2y_mean, y2x_mean, margin, args.verbose)
-        bwd_scores = score_candidates(y, x, y2x_ind, y2x_mean, x2y_mean, margin, args.verbose)
-        fwd_best = x2y_ind[np.arange(x.shape[0]), fwd_scores.argmax(axis=1)]
-        bwd_best = y2x_ind[np.arange(y.shape[0]), bwd_scores.argmax(axis=1)]
-        if args.verbose:
-            print(' - writing alignments to {:s}'.format(args.output))
-            if args.threshold > 0:
-                print(' - with threshold of {:f}'.format(args.threshold))
-        if args.retrieval == 'fwd':
-            for i, j in enumerate(fwd_best):
-                print(fwd_scores[i].max(), src_sents[i], trg_sents[j], sep='\t', file=fout)
-        if args.retrieval == 'bwd':
-            for j, i in enumerate(bwd_best):
-                print(bwd_scores[j].max(), src_sents[i], trg_sents[j], sep='\t', file=fout)
-        if args.retrieval == 'intersect':
-            for i, j in enumerate(fwd_best):
-                if bwd_best[j] == i:
-                    print(fwd_scores[i].max(), src_sents[i], trg_sents[j], sep='\t', file=fout)
-        if args.retrieval == 'max':
-            indices = np.stack((np.concatenate((np.arange(x.shape[0]), bwd_best)),
-                                np.concatenate((fwd_best, np.arange(y.shape[0])))), axis=1)
-            scores = np.concatenate((fwd_scores.max(axis=1), bwd_scores.max(axis=1)))
-            seen_src, seen_trg = set(), set()
-            for i in np.argsort(-scores):
-                src_ind, trg_ind = indices[i]
-                if not src_ind in seen_src and not trg_ind in seen_trg:
-                    seen_src.add(src_ind)
-                    seen_trg.add(trg_ind)
-                    if scores[i] > args.threshold:
-                        print(scores[i], src_sents[src_ind], trg_sents[trg_ind], sep='\t', file=fout)
-
+    src_emb_file = open(args.src_embeddings, "rb")
+    src_txt_file = open(args.src, "r")
+    x = EmbedLoad(src_emb_file, args.dim, verbose=args.verbose, count=args.dim*args.buffer)
+    src_inds, src_sents = TextLoadUnify(src_txt_file, args)
+    ctr_x = 0
+    while x.size != 0 and ctr_x != args.max_it:
+        assert len(x) == len(src_inds), "%d, %d" % (len(x),len(src_inds))
+        tgt_emb_file = open(args.trg_embeddings, "rb")
+        tgt_txt_file = open(args.trg, "r")
+        y = EmbedLoad(tgt_emb_file, args.dim, verbose=args.verbose, count=args.dim*args.buffer)
+        trg_inds, trg_sents = TextLoadUnify(tgt_txt_file, args)
+        ctr_y = 0
+        while y.size != 0 and ctr_y != args.max_it:
+            assert len(y) == len(trg_inds)
+            print("\nMining: %d x %d" % (ctr_x, ctr_y),flush=True)
+            mine(x, y, src_inds, trg_inds, fout, args)
+            y = EmbedLoad(tgt_emb_file, args.dim, verbose=args.verbose, count=args.dim*args.buffer)
+            trg_inds, trg_sents = TextLoadUnify(tgt_txt_file, args)
+            ctr_y += 1
+        x = EmbedLoad(src_emb_file, args.dim, verbose=args.verbose, count=args.dim*args.buffer)
+        src_inds, src_sents = TextLoadUnify(src_txt_file, args)
+        tgt_emb_file.close()
+        tgt_txt_file.close()
+        ctr_x += 1
+    src_emb_file.close()
+    src_txt_file.close()
     fout.close()

@@ -63,6 +63,8 @@ parser.add_argument('--max-sentences', type=int, default=None,
 parser.add_argument('--cpu', action='store_true',
     help='Use CPU instead of GPU')
 
+parser.add_argument('--lowercase', action='store_true',
+    help='Lowercase the corpora before tokenization')
 args = parser.parse_args()
 
 print('LASER: similarity search')
@@ -92,7 +94,7 @@ for l in args.lang:
           os.path.join(args.base_dir, args.output + '.tok.' + l),
           lang=l,
           romanize=True if l == 'el' else False,
-          lower_case=True,
+          lower_case=args.lowercase,
           verbose=args.verbose, over_write=False)
     BPEfastApply(os.path.join(args.base_dir, args.output + '.tok.' + l),
                  os.path.join(args.base_dir, args.output + '.bpe.' + l),
@@ -104,7 +106,7 @@ for l in args.lang:
                verbose=args.verbose, over_write=False)
     d, idx = IndexCreate(os.path.join(args.base_dir, args.output + '.enc.' + l),
                          'FlatL2',
-                         verbose=args.verbose, save_index=False)
+                         verbose=args.verbose, save_index=False, dim=enc.dim)
     all_data.append(d)
     all_index.append(idx)
 
